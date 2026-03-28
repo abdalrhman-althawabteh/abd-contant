@@ -3,53 +3,18 @@ import { Innertube, Platform } from "youtubei.js";
 import { extractVideoId } from "@/lib/youtube";
 import vm from "node:vm";
 
-// Provide a Node.js vm-based JavaScript evaluator for youtubei.js URL deciphering
+// Provide a Node.js vm evaluator for youtubei.js URL deciphering
 Platform.load({
   ...Platform.shim,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   eval: async (data: { output: string }, env: Record<string, any>) => {
-    // Wrap in IIFE so top-level `return` statements are valid
     return vm.runInNewContext(`(function() { ${data.output} })()`, { ...env });
   },
 });
 
-function pickFormat(
-  info: Awaited<ReturnType<Innertube["getBasicInfo"]>>,
-  code: string
-) {
-  const streamingData = info.streaming_data;
-  if (!streamingData) return null;
-
-  const all = [
-    ...(streamingData.formats ?? []),
-    ...(streamingData.adaptive_formats ?? []),
-  ];
-
-  if (code === "audio") {
-    return (
-      all.find((f) => f.mime_type?.includes("audio/mp4") && !f.has_video) ??
-      all.find((f) => f.mime_type?.includes("audio/") && !f.has_video) ??
-      null
-    );
-  }
-
-  const maxHeight: Record<string, number> = {
-    "4k": 2160, "1080p": 1080, "720p": 720, "480p": 480, "360p": 360,
-  };
-  const targetH = maxHeight[code] ?? 720;
-
-  // Prefer muxed (video+audio) at or below target height
-  const muxed = all
-    .filter((f) => f.has_video && f.has_audio && (f.height ?? 0) <= targetH)
-    .sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
-  if (muxed[0]) return muxed[0];
-
-  return (
-    all
-      .filter((f) => f.has_video && (f.height ?? 0) <= targetH)
-      .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))[0] ?? null
-  );
-}
+const HEIGHT_MAP: Record<string, number> = {
+  "4k": 2160, "1080p": 1080, "720p": 720, "480p": 480, "360p": 360,
+};
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
@@ -62,16 +27,42 @@ export async function POST(request: NextRequest) {
 
   try {
     const yt = await Innertube.create();
-    const info = await yt.getBasicInfo(videoId, { client: "WEB" });
+    // ANDROID client returns direct URLs without cipher — most reliable from server IPs
+    const info = await yt.getBasicInfo(videoId, { client: "ANDROID" });
 
-    const format = pickFormat(info, code);
+    const sd = info.streaming_data;
+    if (!sd) return Response.json({ error: "No streaming data available" }, { status: 404 });
+
+    const all = [...(sd.formats ?? []), ...(sd.adaptive_formats ?? [])];
+
+    let format;
+    if (code === "audio") {
+      format =
+        all.find((f) => f.mime_type?.includes("audio/mp4") && !f.has_video) ??
+        all.find((f) => f.mime_type?.includes("audio/") && !f.has_video);
+    } else {
+      const targetH = HEIGHT_MAP[code] ?? 720;
+      // Muxed (video+audio) at or below target
+      const muxed = all
+        .filter((f) => f.has_video && f.has_audio && (f.height ?? 0) <= targetH)
+        .sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
+      format =
+        muxed[0] ??
+        all
+          .filter((f) => f.has_video && (f.height ?? 0) <= targetH)
+          .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))[0];
+    }
+
     if (!format) {
-      return Response.json({ error: "Requested quality not available" }, { status: 404 });
+      return Response.json(
+        { error: `No format found for '${code}' (${all.length} total formats available)` },
+        { status: 404 }
+      );
     }
 
     const streamUrl = await format.decipher(yt.session.player);
     if (!streamUrl) {
-      return Response.json({ error: "Could not get stream URL" }, { status: 500 });
+      return Response.json({ error: "Could not decipher stream URL" }, { status: 500 });
     }
 
     const audioOnly = code === "audio";
@@ -82,7 +73,7 @@ export async function POST(request: NextRequest) {
     return Response.json({ url: streamUrl, filename });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Download failed";
-    console.error("[download]", err);
+    console.error("[download]", message);
     return Response.json({ error: message }, { status: 500 });
   }
 }
