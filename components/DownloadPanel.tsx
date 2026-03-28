@@ -37,24 +37,17 @@ export default function DownloadPanel({ videoUrl, videoId }: DownloadPanelProps)
     if (!selected) return;
     setDownloading(true);
     try {
-        const res = await fetch("/api/download", {
+      const res = await fetch("/api/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: videoUrl, code: selected.code }),
       });
 
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error);
-      }
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error ?? "Download failed");
 
-      const blob = await res.blob();
-      const ext = selected.code === "audio" ? "m4a" : "mp4";
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `abd-${videoId}.${ext}`;
-      a.click();
-      URL.revokeObjectURL(a.href);
+      // Open the stream URL directly — browser downloads from YouTube CDN
+      window.open(data.url, "_blank");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Download failed");
     } finally {
