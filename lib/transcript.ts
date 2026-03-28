@@ -6,7 +6,13 @@ export interface TranscriptSegment {
 
 const ANDROID_CLIENT_VERSION = "20.10.38";
 
-async function getCaptionUrl(videoId: string): Promise<string> {
+interface CaptionTrack {
+  baseUrl: string;
+  languageCode: string;
+  kind?: string;
+}
+
+async function getCaptionTracks(videoId: string): Promise<CaptionTrack[]> {
   const res = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
     method: "POST",
     headers: {
@@ -24,74 +30,53 @@ async function getCaptionUrl(videoId: string): Promise<string> {
   const data = await res.json() as {
     captions?: {
       playerCaptionsTracklistRenderer?: {
-        captionTracks?: { baseUrl: string; languageCode: string; kind?: string }[]
+        captionTracks?: CaptionTrack[]
       }
     }
   };
 
-  const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
-  if (tracks.length === 0) throw new Error("No transcript available");
-
-  // Prefer English track; fallback to first
-  const track = tracks.find((t) => t.languageCode === "en") ?? tracks[0];
-  return track.baseUrl;
+  return data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
 }
 
-function parseTranscriptXml(xml: string): TranscriptSegment[] {
+function pickTrack(tracks: CaptionTrack[]): CaptionTrack {
+  // Prefer manual (non-asr) tracks first, then auto-generated
+  const manual = tracks.filter((t) => t.kind !== "asr");
+  const auto = tracks.filter((t) => t.kind === "asr");
+  const pool = manual.length > 0 ? manual : auto;
+
+  // Within pool: prefer English, then Arabic, then first available
+  return (
+    pool.find((t) => t.languageCode === "en") ??
+    pool.find((t) => t.languageCode === "ar") ??
+    pool[0]
+  );
+}
+
+interface Json3Event {
+  tStartMs?: number;
+  dDurationMs?: number;
+  segs?: { utf8?: string }[];
+}
+
+function parseJson3(json: { events?: Json3Event[] }): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
-
-  // Parse <p t="..." d="..."> ... </p> elements (timedtext format 3)
-  const pRegex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = pRegex.exec(xml)) !== null) {
-    const offset = parseInt(match[1], 10);
-    const duration = parseInt(match[2], 10);
-    const inner = match[3];
-
-    // Extract text from <s> tags or raw text
-    let text = "";
-    const sRegex = /<s[^>]*>([^<]*)<\/s>/g;
-    let sm: RegExpExecArray | null;
-    while ((sm = sRegex.exec(inner)) !== null) text += sm[1];
-    if (!text) text = inner.replace(/<[^>]+>/g, "");
-
-    text = decodeEntities(text).trim();
-    if (text) segments.push({ text, offset, duration });
+  for (const ev of json.events ?? []) {
+    if (!ev.segs || ev.tStartMs == null) continue;
+    const text = ev.segs.map((s) => s.utf8 ?? "").join("").replace(/\n/g, " ").trim();
+    if (text) segments.push({ text, offset: ev.tStartMs, duration: ev.dDurationMs ?? 0 });
   }
-
-  // Fallback: old timedtext format with <text start="..." dur="...">
-  if (segments.length === 0) {
-    const oldRegex = /<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>/g;
-    while ((match = oldRegex.exec(xml)) !== null) {
-      const text = decodeEntities(match[3]).trim();
-      if (text) segments.push({
-        text,
-        offset: Math.round(parseFloat(match[1]) * 1000),
-        duration: Math.round(parseFloat(match[2]) * 1000),
-      });
-    }
-  }
-
   return segments;
 }
 
-function decodeEntities(str: string): string {
-  return str
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&apos;/g, "'")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)));
-}
-
 export async function getTranscript(videoId: string): Promise<TranscriptSegment[]> {
-  const captionUrl = await getCaptionUrl(videoId);
+  const tracks = await getCaptionTracks(videoId);
+  if (tracks.length === 0) throw new Error("No transcript available for this video");
 
-  const res = await fetch(captionUrl, {
+  const track = pickTrack(tracks);
+
+  // Request JSON3 format — much more reliable than XML
+  const url = track.baseUrl.replace(/&fmt=[^&]+/, "") + "&fmt=json3";
+  const res = await fetch(url, {
     headers: {
       "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36,gzip(gfe)",
     },
@@ -99,8 +84,8 @@ export async function getTranscript(videoId: string): Promise<TranscriptSegment[
 
   if (!res.ok) throw new Error("Failed to fetch transcript");
 
-  const xml = await res.text();
-  const segments = parseTranscriptXml(xml);
+  const json = await res.json() as { events?: Json3Event[] };
+  const segments = parseJson3(json);
   if (segments.length === 0) throw new Error("No transcript available");
   return segments;
 }
